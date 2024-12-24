@@ -2935,13 +2935,16 @@ cleanup:
  */
 int mbedtls_ssl_write_record(mbedtls_ssl_context *ssl, int force_flush)
 {
-    int ret, done = 0;
-    size_t len = ssl->out_msglen;
+    int ret;
+    size_t msg_len = ssl->out_msglen;
+    const int msg_type = ssl->out_msgtype;
     int flush = force_flush;
 
-    MBEDTLS_SSL_DEBUG_MSG(2, ("=> write record"));
+    MBEDTLS_SSL_DEBUG_MSG(2, ("=> write record %d %zu", ssl->out_msgtype, ssl->out_msglen));
+    MBEDTLS_SSL_DEBUG_BUF(4, "msg before fragmenting",
+                          ssl->out_msg, ssl->out_msglen);
 
-    if (!done) {
+    while (msg_len > 0) {
         unsigned i;
         size_t protected_record_size;
 #if defined(MBEDTLS_SSL_VARIABLE_BUFFER_LENGTH)
@@ -2949,6 +2952,28 @@ int mbedtls_ssl_write_record(mbedtls_ssl_context *ssl, int force_flush)
 #else
         size_t out_buf_len = MBEDTLS_SSL_OUT_BUFFER_LEN;
 #endif
+        size_t rec_len = msg_len;
+#if defined(MBEDTLS_SSL_MAX_FRAGMENT_LENGTH)
+        const size_t frag_len = 512; //mbedtls_ssl_get_output_max_frag_len(ssl);
+        if (rec_len > frag_len) {
+            rec_len = frag_len;
+        }
+#endif
+        msg_len -= rec_len;
+        uint8_t *dp = NULL;
+        if (msg_len > 0) {
+            /* Make room for the current fragment's footer and next fragment's header. */
+            size_t need_space = mbedtls_ssl_out_hdr_len(ssl);
+            if (ssl->transform_out != NULL) {
+                need_space += ssl->transform_out->taglen;
+                need_space += 16; // XXX
+            }
+            MBEDTLS_SSL_DEBUG_MSG(2, ("shift %zu by %zu", msg_len, need_space));
+            dp = ssl->out_msg + rec_len + need_space;
+            memmove(dp, ssl->out_msg + rec_len, msg_len);
+            MBEDTLS_SSL_DEBUG_BUF(4, "msg remainder", dp, msg_len);
+        }
+
         /* Skip writing the record content type to after the encryption,
          * as it may change when using the CID extension. */
         mbedtls_ssl_protocol_version tls_ver = ssl->tls_version;
@@ -2963,19 +2988,19 @@ int mbedtls_ssl_write_record(mbedtls_ssl_context *ssl, int force_flush)
                                   tls_ver);
 
         memcpy(ssl->out_ctr, ssl->cur_out_ctr, MBEDTLS_SSL_SEQUENCE_NUMBER_LEN);
-        MBEDTLS_PUT_UINT16_BE(len, ssl->out_len, 0);
 
         if (ssl->transform_out != NULL) {
             mbedtls_record rec;
 
             rec.buf         = ssl->out_iv;
-            rec.buf_len     = out_buf_len - (size_t) (ssl->out_iv - ssl->out_buf);
-            rec.data_len    = ssl->out_msglen;
+            rec.buf_len     = 600 - 56; // XXX
+            rec.data_len    = rec_len;
             rec.data_offset = (size_t) (ssl->out_msg - rec.buf);
+            (void) out_buf_len;
 
             memcpy(&rec.ctr[0], ssl->out_ctr, sizeof(rec.ctr));
             mbedtls_ssl_write_version(rec.ver, ssl->conf->transport, tls_ver);
-            rec.type = ssl->out_msgtype;
+            rec.type = msg_type;
 
 #if defined(MBEDTLS_SSL_DTLS_CONNECTION_ID)
             /* The CID is set by mbedtls_ssl_encrypt_buf(). */
@@ -2998,11 +3023,16 @@ int mbedtls_ssl_write_record(mbedtls_ssl_context *ssl, int force_flush)
 #if defined(MBEDTLS_SSL_DTLS_CONNECTION_ID)
             memcpy(ssl->out_cid, rec.cid, rec.cid_len);
 #endif /* MBEDTLS_SSL_DTLS_CONNECTION_ID */
-            ssl->out_msglen = len = rec.data_len;
+            protected_record_size = rec.data_len + mbedtls_ssl_out_hdr_len(ssl);
             MBEDTLS_PUT_UINT16_BE(rec.data_len, ssl->out_len, 0);
+        } else {
+            protected_record_size = rec_len + mbedtls_ssl_out_hdr_len(ssl);
+            MBEDTLS_PUT_UINT16_BE(rec_len, ssl->out_len, 0);
         }
 
-        protected_record_size = len + mbedtls_ssl_out_hdr_len(ssl);
+        if (msg_len > 0) {
+            MBEDTLS_SSL_DEBUG_BUF(4, "msg remainder 2", dp, msg_len);
+        }
 
 #if defined(MBEDTLS_SSL_PROTO_DTLS)
         /* In case of DTLS, double-check that we don't exceed
@@ -3026,7 +3056,7 @@ int mbedtls_ssl_write_record(mbedtls_ssl_context *ssl, int force_flush)
         MBEDTLS_SSL_DEBUG_MSG(3, ("output record: msgtype = %u, "
                                   "version = [%u:%u], msglen = %" MBEDTLS_PRINTF_SIZET,
                                   ssl->out_hdr[0], ssl->out_hdr[1],
-                                  ssl->out_hdr[2], len));
+                                  ssl->out_hdr[2], protected_record_size));
 
         MBEDTLS_SSL_DEBUG_BUF(4, "output record sent to network",
                               ssl->out_hdr, protected_record_size);
