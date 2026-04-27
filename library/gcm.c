@@ -148,10 +148,14 @@ static int gcm_gen_table(mbedtls_gcm_context *ctx)
 
             for (i = 2; i < MBEDTLS_GCM_HTABLE_SIZE; i <<= 1) {
                 for (j = 1; j < i; j++) {
-                    mbedtls_xor_no_simd((unsigned char *) ctx->H[i+j],
-                                        (unsigned char *) ctx->H[i],
-                                        (unsigned char *) ctx->H[j],
-                                        16);
+                    /* Use 32-bit XOR — H entries are uint64_t-aligned */
+                    uint32_t *d = (uint32_t *) ctx->H[i+j];
+                    const uint32_t *a = (const uint32_t *) ctx->H[i];
+                    const uint32_t *b = (const uint32_t *) ctx->H[j];
+                    d[0] = a[0] ^ b[0];
+                    d[1] = a[1] ^ b[1];
+                    d[2] = a[2] ^ b[2];
+                    d[3] = a[3] ^ b[3];
                 }
             }
     }
@@ -252,38 +256,69 @@ static void gcm_mult_largetable(uint8_t *output, const uint8_t *x, uint64_t H[25
 {
     int i;
     uint64_t u64z[2];
-    uint16_t *u16z = (uint16_t *) u64z;
     uint8_t *u8z = (uint8_t *) u64z;
     uint8_t rem;
 
-    u64z[0] = 0;
-    u64z[1] = 0;
+    /*
+     * Use 32-bit operations for the XOR and shift/carry.
+     * Both u64z and H[i] are uint64_t-aligned, so 32-bit access is safe.
+     * This avoids the byte-by-byte XOR fallback on architectures without
+     * MBEDTLS_EFFICIENT_UNALIGNED_ACCESS (e.g., MIPS32), and avoids
+     * 64-bit shift emulation on 32-bit architectures.
+     */
+    uint32_t *w = (uint32_t *) u64z;
+
+    w[0] = 0;
+    w[1] = 0;
+    w[2] = 0;
+    w[3] = 0;
 
     if (MBEDTLS_IS_BIG_ENDIAN) {
         for (i = 15; i > 0; i--) {
-            mbedtls_xor_no_simd(u8z, u8z, (uint8_t *) H[x[i]], 16);
+            const uint32_t *h = (const uint32_t *) H[x[i]];
+            w[0] ^= h[0];
+            w[1] ^= h[1];
+            w[2] ^= h[2];
+            w[3] ^= h[3];
+
             rem = u8z[15];
 
-            u64z[1] >>= 8;
-            u8z[8] = u8z[7];
-            u64z[0] >>= 8;
+            /* 128-bit right-shift by 8 (big-endian word order) */
+            w[3] = (w[3] >> 8) | (w[2] << 24);
+            w[2] = (w[2] >> 8) | (w[1] << 24);
+            w[1] = (w[1] >> 8) | (w[0] << 24);
+            w[0] = (w[0] >> 8);
 
-            u16z[0] ^= MBEDTLS_GET_UINT16_LE(&last8[rem], 0);
+            w[0] ^= ((uint32_t) MBEDTLS_GET_UINT16_LE(&last8[rem], 0)) << 16;
         }
     } else {
         for (i = 15; i > 0; i--) {
-            mbedtls_xor_no_simd(u8z, u8z, (uint8_t *) H[x[i]], 16);
+            const uint32_t *h = (const uint32_t *) H[x[i]];
+            w[0] ^= h[0];
+            w[1] ^= h[1];
+            w[2] ^= h[2];
+            w[3] ^= h[3];
+
             rem = u8z[15];
 
-            u64z[1] <<= 8;
-            u8z[8] = u8z[7];
-            u64z[0] <<= 8;
+            /* 128-bit left-shift by 8 (little-endian word order) */
+            w[3] = (w[3] << 8) | (w[2] >> 24);
+            w[2] = (w[2] << 8) | (w[1] >> 24);
+            w[1] = (w[1] << 8) | (w[0] >> 24);
+            w[0] = (w[0] << 8);
 
-            u16z[0] ^= last8[rem];
+            w[0] ^= (uint32_t) last8[rem];
         }
     }
 
-    mbedtls_xor_no_simd(output, u8z, (uint8_t *) H[x[0]], 16);
+    {
+        const uint32_t *h = (const uint32_t *) H[x[0]];
+        uint32_t *out = (uint32_t *) output;
+        out[0] = w[0] ^ h[0];
+        out[1] = w[1] ^ h[1];
+        out[2] = w[2] ^ h[2];
+        out[3] = w[3] ^ h[3];
+    }
 }
 #else
 /*
